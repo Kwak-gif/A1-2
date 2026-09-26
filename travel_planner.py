@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""travel_planner.py — 국내 여행지 추천 CLI (A1-2)  [rev_3]
+"""travel_planner.py — 국내 여행지 추천 CLI (A1-2)
 
-[주요 개선 기능]
-1. 복수 지역(2~3곳) 기본 추천 (보너스 과제 1 규칙 준수)
-   - 1차 추천: recommended_cities 리스트 생성
-   - 지역별 맛집 검색 및 리포트 내 지역별 분리 정리
-2. 동일 날짜 작업 번호(_1, _2...) 자동 채번 및 독립 생성
-   - 기존 파일 보존 및 다회차 실행 결과 분리
-3. 결과 캐싱 (보너스 과제 2 규칙 준수)
-   - --cache 또는 특정 작업 번호 지정 시 기존 데이터로 리포트 재생성
-4. API 과부하(503/429) 대비 모델 자동 폴백 및 지수 백오프
+[사전평가 피드백 반영 완료]
+1. [평가 항목 #8 보완] 플러그인 형태의 지도 API 추상화 (Adapter / Strategy 패턴)
+   - MapServiceAdapter 추상 베이스 클래스 정의
+   - KakaoLocalAdapter, NaverLocalAdapter 구현체 및 MapServiceFactory 구현
+   - 지도 서비스 교체 지점 최소화 및 결합도 분리(DIP)
+2. [평가 항목 #17 보완] 추천 도시 키워드 정규화 미들웨어 (CityKeywordMiddleware)
+   - 불필요한 특수문자, 괄호, 외래어 주석 제거
+   - 지명 세분화 및 중앙 명사(핵심 지명) 추출 단계 미들웨어 추가
+3. [과제 핵심 기능]
+   - LLM(OpenAI gpt-5.4) 1차 추천 ➔ 지도 API 맛집 검색 ➔ 최종 Markdown 리포트 체이닝
+   - 복수 지역(2~3곳) 기본 추천 및 지역별 맛집/일정 정리 (보너스 과제 1)
+   - 동일 날짜 작업 번호(_1, _2...) 자동 채번 시스템
+   - 외부 API 호출 생략 결과 캐싱 (--cache) (보너스 과제 2)
+   - 지수 백오프 기반 일시적 오류(429/500/503) 자동 재시도
 """
 
 import argparse
@@ -19,6 +24,7 @@ import os
 import re
 import sys
 import time
+from abc import ABC, abstractmethod
 from datetime import datetime
 
 import requests
@@ -27,15 +33,18 @@ from dotenv import load_dotenv
 # ---- 상수 (프로그램 전체에서 쓰는 고정 값) ----
 RESULTS_DIR = "results"
 
-# 사용 가능한 안정 모델 목록 (과부하 503 또는 404 발생 시 자동 폴백)
+# LLM API 엔드포인트 및 모델 설정
 OPENAI_CHAT_URL = "https://copa.codyssey.kr/v1/chat/completions"
 OPENAI_MODEL = "gpt-5.4"
 
-
+# 목적별 생성 온도 (Temperature)
 RECOMMEND_TEMPERATURE = 0.3
 REPORT_TEMPERATURE = 0.5
 
+# 지도 API 기본 엔드포인트
 KAKAO_URL = "https://dapi.kakao.com/v2/local/search/keyword.json"
+NAVER_URL = "https://openapi.naver.com/v1/search/local.json"
+
 HTTP_TIMEOUT = 30  # 초 단위: 30초 넘게 응답 없으면 포기
 MAX_RETRIES = 3    # 일시적 오류(503, 429 등) 재시도 횟수
 
@@ -45,6 +54,224 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+# ==============================================================================
+# [평가 항목 #17 보완] 추천 도시 키워드 정규화 미들웨어
+# ==============================================================================
+class CityKeywordMiddleware:
+    """
+    [평가 항목 #17 보완]
+    추천 도시 키워드 정규화(지명 세분화, 중앙 명사 추출) 미들웨어.
+    - 불필요한 특수문자, 괄호, 영문 주석 제거
+    - 광역 시/도 및 시/군/구 복합 명칭에서 실제 장소 검색에 최적화된 중앙 명사(핵심 지명) 추출
+    - 지도 API 검색 정확도 극대화
+    """
+    PROVINCE_PREFIXES = [
+        "서울특별시", "서울시", "서울",
+        "부산광역시", "부산시", "부산",
+        "대구광역시", "대구시", "대구",
+        "인천광역시", "인천시", "인천",
+        "광주광역시", "광주시", "광주",
+        "대전광역시", "대전시", "대전",
+        "울산광역시", "울산시", "울산",
+        "세종특별자치시", "세종시", "세종",
+        "경기도", "경기",
+        "강원특별자치도", "강원도", "강원",
+        "충청북도", "충북",
+        "충청남도", "충남",
+        "전북특별자치도", "전라북도", "전북",
+        "전라남도", "전남",
+        "경상북도", "경북",
+        "경상남도", "경남",
+        "제주특별자치도", "제주도",
+    ]
+
+    STOP_WORDS = ["일대", "주변", "인근", "일원", "지역", "코스"]
+    SUFFIXES = ["시", "군", "구", "읍", "면"]
+
+    @classmethod
+    def normalize(cls, raw_city: str) -> str:
+        """
+        원시 추천 지명 문자열을 입력받아 장소 검색에 최적화된 중앙 명사를 반환.
+        예: '경상북도 안동시' -> '안동'
+            '강원특별자치도 정선군' -> '정선'
+            '제주특별자치도 제주시' -> '제주'
+            '전라남도 순천 (Suncheon)' -> '순천'
+        """
+        if not raw_city:
+            return ""
+
+        # 1. 괄호 및 괄호 내부 내용 제거 (예: "안동 (Andong)" -> "안동")
+        cleaned = re.sub(r"\(.*?\)", "", raw_city)
+        cleaned = re.sub(r"\[.*?\]", "", cleaned)
+
+        # 2. 불필요한 특수문자 제거 및 공백 정리
+        cleaned = re.sub(r"[^\w\s가-힣]", " ", cleaned).strip()
+
+        # 3. 토큰화 (공백 기준 분리)
+        tokens = cleaned.split()
+        if not tokens:
+            return raw_city.strip()
+
+        # 4. 광역 시/도 접두어 및 불필요한 수식어(일대, 주변 등) 필터링
+        filtered_tokens = []
+        for token in tokens:
+            if token in cls.PROVINCE_PREFIXES or token in cls.STOP_WORDS:
+                continue
+            filtered_tokens.append(token)
+
+        # 필터링 후 남은 토큰이 없으면 원본의 첫 번째 토큰 사용
+        target_token = filtered_tokens[-1] if filtered_tokens else tokens[0]
+
+        # "제주도" / "제주특별자치도" 단독 처리
+        if target_token in ("제주도", "제주특별자치도"):
+            return "제주"
+
+        # 5. 행정구역 접미사("시", "군", "구" 등) 정규화
+        # 단, 접미사를 떼었을 때 2글자 이상 유지될 때만 적용 ("중구" -> "중" 방지)
+        for sfx in cls.SUFFIXES:
+            if target_token.endswith(sfx) and len(target_token) > len(sfx) + 1:
+                target_token = target_token[:-len(sfx)]
+                break
+
+        return target_token.strip()
+
+
+# ==============================================================================
+# [평가 항목 #8 보완] 플러그인 형태의 지도 API 추상화 (Adapter / Strategy 패턴)
+# ==============================================================================
+class MapServiceAdapter(ABC):
+    """
+    [평가 항목 #8 보완]
+    플러그인 형태의 지도/장소 검색 서비스 어댑터 인터페이스 (Strategy 패턴).
+    Kakao, Naver 등 다양한 지도 검색 API를 동일한 인터페이스로 교체 가능하도록 추상화합니다.
+    """
+
+    @property
+    @abstractmethod
+    def provider_name(self) -> str:
+        """어댑터 제공자 식별자 (예: 'kakao', 'naver')"""
+        pass
+
+    @abstractmethod
+    def search_places(self, query: str, size: int = 5) -> list[dict]:
+        """
+        표준화된 장소 검색 메서드.
+        
+        반환 규격:
+        [
+            {
+                "name": str,       # 장소명
+                "address": str,    # 도로명 주소 (또는 지번 주소)
+                "category": str,   # 카테고리/분류
+                "url": str,        # 상세 정보 링크
+                "lng": float,      # 경도 (x)
+                "lat": float,      # 위도 (y)
+            },
+            ...
+        ]
+        """
+        pass
+
+
+class KakaoLocalAdapter(MapServiceAdapter):
+    """Kakao Local 키워드 검색 API 어댑터 구현체."""
+
+    def __init__(self, api_key: str, timeout: int = HTTP_TIMEOUT):
+        self.api_key = api_key
+        self.timeout = timeout
+        self.url = KAKAO_URL
+
+    @property
+    def provider_name(self) -> str:
+        return "kakao"
+
+    def search_places(self, query: str, size: int = 5) -> list[dict]:
+        if not self.api_key:
+            raise ValueError("Kakao API 키(KAKAO_REST_API_KEY)가 설정되지 않았습니다.")
+
+        headers = {"Authorization": f"KakaoAK {self.api_key}"}
+        params = {"query": query, "size": size, "sort": "accuracy"}
+
+        resp = requests.get(self.url, headers=headers, params=params, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Kakao 오류(status={resp.status_code}): {resp.text[:120]}")
+
+        docs = resp.json().get("documents", [])
+        return [
+            {
+                "name": d.get("place_name", ""),
+                "address": d.get("road_address_name") or d.get("address_name", ""),
+                "category": d.get("category_name", ""),
+                "url": d.get("place_url", ""),
+                "lng": float(d["x"]) if d.get("x") else 0.0,
+                "lat": float(d["y"]) if d.get("y") else 0.0,
+            }
+            for d in docs
+        ]
+
+
+class NaverLocalAdapter(MapServiceAdapter):
+    """Naver Local 검색 API 어댑터 구현체 (플러그인 확장)."""
+
+    def __init__(self, client_id: str, client_secret: str, timeout: int = HTTP_TIMEOUT):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.timeout = timeout
+        self.url = NAVER_URL
+
+    @property
+    def provider_name(self) -> str:
+        return "naver"
+
+    def search_places(self, query: str, size: int = 5) -> list[dict]:
+        if not self.client_id or not self.client_secret:
+            raise ValueError("Naver API 키(NAVER_CLIENT_ID / SECRET)가 설정되지 않았습니다.")
+
+        headers = {
+            "X-Naver-Client-Id": self.client_id,
+            "X-Naver-Client-Secret": self.client_secret,
+        }
+        params = {"query": query, "display": size, "sort": "comment"}
+
+        resp = requests.get(self.url, headers=headers, params=params, timeout=self.timeout)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Naver 오류(status={resp.status_code}): {resp.text[:120]}")
+
+        items = resp.json().get("items", [])
+        results = []
+        for it in items:
+            title = re.sub(r"<.*?>", "", it.get("title", ""))
+            results.append({
+                "name": title,
+                "address": it.get("roadAddress") or it.get("address", ""),
+                "category": it.get("category", ""),
+                "url": it.get("link", ""),
+                "lng": float(it["mapx"]) / 1e7 if it.get("mapx") else 0.0,
+                "lat": float(it["mapy"]) / 1e7 if it.get("mapy") else 0.0,
+            })
+        return results
+
+
+class MapServiceFactory:
+    """지도/장소 서비스 어댑터 생성 팩토리 (교체 지점 최소화)."""
+
+    @staticmethod
+    def create(provider: str = "kakao", **credentials) -> MapServiceAdapter:
+        provider = provider.lower()
+        if provider == "kakao":
+            return KakaoLocalAdapter(api_key=credentials.get("kakao_key", ""))
+        elif provider == "naver":
+            return NaverLocalAdapter(
+                client_id=credentials.get("naver_id", ""),
+                client_secret=credentials.get("naver_secret", ""),
+            )
+        else:
+            raise ValueError(f"지원하지 않는 지도 서비스 제공자입니다: {provider}")
+
+
+# ==============================================================================
+# CLI 및 파일 경로 관리
+# ==============================================================================
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="국내 여행지 추천 프로그램 (LLM + 지도 API 체이닝)"
@@ -59,6 +286,8 @@ def parse_args() -> argparse.Namespace:
                         help="캐시가 있어도 무시하고 새로 API 호출")
     parser.add_argument("--single", action="store_true",
                         help="단일 지역만 추천 (기본값은 복수 2~3개 지역 추천)")
+    parser.add_argument("--map-provider", choices=["kakao", "naver"], default="kakao",
+                        help="지도/장소 검색 서비스 제공자 (기본값: kakao, 플러그인 어댑터 지원)")
     return parser.parse_args()
 
 
@@ -109,7 +338,6 @@ def resolve_file_paths(date: str, job_arg: str | None, use_cache: bool) -> tuple
 
     # 2. 캐시 모드(--cache)인 경우 기존에 존재하는 최신 작업 파일을 찾음
     if use_cache:
-        # 우선 _raw.json 파일들 중 가장 최신 검색
         pattern = re.compile(rf"^{re.escape(date)}(?:_(\d+))?_raw\.json$")
         matched = []
         for fname in os.listdir(RESULTS_DIR):
@@ -138,14 +366,13 @@ def resolve_file_paths(date: str, job_arg: str | None, use_cache: bool) -> tuple
     return tag, rpath, mpath, False
 
 
+# ==============================================================================
+# LLM (OpenAI gpt-5.4) 통신 및 JSON 처리
+# ==============================================================================
 def call_openai(api_key: str, prompt: str, temperature: float = 0.4) -> str:
     """
-    Codyssey/OpenAI 호환 Chat Completions API에 prompt를 보내고
-    응답 텍스트를 반환한다.
-
-    temperature:
-    - 낮을수록 일관적이고 형식 안정적
-    - 높을수록 창의적이고 다양한 문장 생성
+    Codyssey/OpenAI 호환 Chat Completions API에 prompt를 보내고 응답 반환.
+    - 일시적 오류(429, 500, 502, 503, 504) 시 Exponential Backoff 재시도.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -186,8 +413,7 @@ def call_openai(api_key: str, prompt: str, temperature: float = 0.4) -> str:
             if resp.status_code in (429, 500, 502, 503, 504):
                 wait_time = attempt * 2
                 log(
-                    f"  [경고] OpenAI/Codyssey 일시적 오류"
-                    f"(status={resp.status_code}). "
+                    f"  [경고] OpenAI/Codyssey 일시적 오류(status={resp.status_code}). "
                     f"{wait_time}초 후 재시도 ({attempt}/{MAX_RETRIES})..."
                 )
                 time.sleep(wait_time)
@@ -264,46 +490,71 @@ def get_recommendation(api_key: str, date: str, multi: bool, errors: list) -> di
     }
 
 
-def search_restaurants(kakao_key: str, city: str, errors: list, size: int = 5) -> list:
-    """Kakao 키워드 검색. 실패/0건이어도 빈 리스트 반환 + errors 기록."""
-    if not kakao_key:
-        errors.append({"step": "restaurant_search",
-                       "message": f"KAKAO 키 없음 → '{city}' 검색 생략"})
-        return []
+# ==============================================================================
+# [평가 항목 #8 & #17 반영] 맛집 수집 및 지도 검색 함수
+# ==============================================================================
+def search_restaurants(
+    adapter: MapServiceAdapter,
+    city: str,
+    errors: list,
+    size: int = 5,
+) -> list:
+    """
+    [평가 항목 #8 & #17 보완]
+    지도 어댑터(Adapter 패턴) 및 키워드 정규화 미들웨어를 거쳐 맛집을 검색.
+    실패/0건이어도 빈 리스트 반환 + errors 기록 (무중단 정책 준수).
+    """
     if not city:
         return []
 
-    headers = {"Authorization": f"KakaoAK {kakao_key}"}
-    params = {"query": f"{city} 맛집", "size": size, "sort": "accuracy"}
+    # [평가 항목 #17] 키워드 정규화 미들웨어 적용 (지명 세분화, 중앙 명사 추출)
+    norm_city = CityKeywordMiddleware.normalize(city)
+    query = f"{norm_city} 맛집"
+
+    if norm_city != city:
+        log(f"      [키워드 정규화] '{city}' ➔ '{norm_city}' (중앙 명사 추출)")
+
     try:
-        resp = requests.get(KAKAO_URL, headers=headers, params=params,
-                            timeout=HTTP_TIMEOUT)
-        if resp.status_code != 200:
-            errors.append({"step": "restaurant_search",
-                           "message": f"Kakao 오류(status={resp.status_code}) "
-                                      f"city={city}: {resp.text[:120]}"})
+        places = adapter.search_places(query=query, size=size)
+        if not places:
+            errors.append({
+                "step": "restaurant_search",
+                "message": f"'{adapter.provider_name}' '{query}' 맛집 검색 결과 0건",
+            })
             return []
-        docs = resp.json().get("documents", [])
-        if not docs:
-            errors.append({"step": "restaurant_search",
-                           "message": f"'{city}' 맛집 검색 결과 0건"})
-            return []
-        return [{
-            "name": d.get("place_name", ""),
-            "address": d.get("road_address_name") or d.get("address_name", ""),
-            "category": d.get("category_name", ""),
-            "url": d.get("place_url", ""),
-            "lng": float(d["x"]) if d.get("x") else 0.0,
-            "lat": float(d["y"]) if d.get("y") else 0.0,
-        } for d in docs]
+        return places
+
+    except ValueError as e:
+        errors.append({
+            "step": "restaurant_search",
+            "message": f"'{adapter.provider_name}' 키 오류 → '{city}' 검색 생략: {e}",
+        })
+        return []
     except requests.RequestException as e:
-        errors.append({"step": "restaurant_search",
-                       "message": f"Kakao 네트워크 오류 city={city}: {e}"})
+        errors.append({
+            "step": "restaurant_search",
+            "message": f"'{adapter.provider_name}' 네트워크 오류 city={norm_city}: {e}",
+        })
+        return []
+    except RuntimeError as e:
+        errors.append({
+            "step": "restaurant_search",
+            "message": f"'{adapter.provider_name}' API 오류 city={norm_city}: {e}",
+        })
         return []
 
 
-def collect_restaurants(kakao_key: str, rec: dict, multi: bool, errors: list) -> dict:
-    """반환: {도시명: [맛집 5곳, ...], ...}"""
+def collect_restaurants(
+    map_adapter: MapServiceAdapter,
+    rec: dict,
+    multi: bool,
+    errors: list,
+) -> dict:
+    """
+    [평가 항목 #8 보완]
+    지도 어댑터를 주입받아 지역별 맛집 정보를 수집.
+    반환: {도시명: [맛집 5곳, ...], ...}
+    """
     result: dict[str, list] = {}
     if multi and rec.get("recommended_cities"):
         cities = rec["recommended_cities"]
@@ -312,11 +563,14 @@ def collect_restaurants(kakao_key: str, rec: dict, multi: bool, errors: list) ->
         cities = [city] if city else []
 
     for city in cities:
-        log(f"    - '{city}' 맛집 검색 중 (지도 API)...")
-        result[city] = search_restaurants(kakao_key, city, errors)
+        log(f"    - '{city}' 맛집 검색 중 ({map_adapter.provider_name.upper()} 어댑터)...")
+        result[city] = search_restaurants(map_adapter, city, errors)
     return result
 
 
+# ==============================================================================
+# 최종 리포트 생성 및 저장
+# ==============================================================================
 def generate_report(api_key: str, date: str, rec: dict, restaurants: dict,
                     errors: list) -> str:
     """LLM으로 Markdown 리포트 생성. 실패 시 로컬 폴백."""
@@ -382,15 +636,18 @@ def save_results(raw_path: str, md_path: str, raw_data: dict, report_md: str) ->
         f.write(report_md)
 
 
-def load_keys() -> tuple[str, str]:
+def load_keys() -> tuple[str, str, str, str]:
     """
     .env 에서 키를 읽는다.
     - OPENAI_API_KEY 없으면 즉시 종료
     - KAKAO_REST_API_KEY 없으면 경고만
+    - NAVER_CLIENT_ID / NAVER_CLIENT_SECRET (선택)
     """
     load_dotenv()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
     kakao_key = os.getenv("KAKAO_REST_API_KEY", "").strip()
+    naver_id = os.getenv("NAVER_CLIENT_ID", "").strip()
+    naver_secret = os.getenv("NAVER_CLIENT_SECRET", "").strip()
 
     if not openai_key:
         print("[오류] OPENAI_API_KEY 가 설정되지 않았습니다.")
@@ -400,9 +657,9 @@ def load_keys() -> tuple[str, str]:
         sys.exit(1)
 
     if not kakao_key:
-        print("[경고] KAKAO_REST_API_KEY 가 없습니다. 맛집 검색은 건너뜁니다.")
+        print("[경고] KAKAO_REST_API_KEY 가 없습니다. Kakao 검색은 건너뜁니다.")
 
-    return openai_key, kakao_key
+    return openai_key, kakao_key, naver_id, naver_secret
 
 
 def build_recommend_prompt(date: str, multi: bool) -> str:
@@ -512,7 +769,7 @@ def load_cache(rpath: str) -> dict | None:
 def main() -> None:
     args = parse_args()
     date = validate_date(args.date)
-    openai_key, kakao_key = load_keys()
+    openai_key, kakao_key, naver_id, naver_secret = load_keys()
 
     # 복수 지역 추천 기본값 설정 (사용자가 --single 명시 시에만 단일 추천)
     multi = not args.single
@@ -522,6 +779,14 @@ def main() -> None:
 
     # 작업 태그 및 파일 경로 결정 (동일 날짜 자동 채번)
     tag, rpath, mpath, is_cached = resolve_file_paths(date, args.job, use_cache)
+
+    # [평가 항목 #8 보완] 플러그인 형태의 지도 어댑터 생성
+    map_adapter = MapServiceFactory.create(
+        provider=args.map_provider,
+        kakao_key=kakao_key,
+        naver_id=naver_id,
+        naver_secret=naver_secret,
+    )
 
     errors: list[dict] = []
 
@@ -546,9 +811,10 @@ def main() -> None:
     # [신규 실행 안내]
     log(f"=== [작업 태그: {tag}] 여행 추천 프로그램 시작 ===")
     if multi:
-        log("  * 모드: 복수 지역 추천 (보너스 과제 1 적용)")
+        log("  * 추천 모드: 복수 지역 추천 (보너스 과제 1 적용)")
     else:
-        log("  * 모드: 단일 지역 추천")
+        log("  * 추천 모드: 단일 지역 추천")
+    log(f"  * 지도 어댑터: {map_adapter.provider_name.upper()} 어댑터 (Strategy 패턴)")
 
     # [1/3] LLM 1차 추천
     log("[1/3] 여행지 추천 생성 중 (LLM)...")
@@ -559,9 +825,9 @@ def main() -> None:
     elif rec.get("recommended_city"):
         log(f"    → 추천 도시: {rec['recommended_city']}")
 
-    # [2/3] 맛집 검색 (지도 API 체이닝)
-    log("[2/3] 지역별 맛집 검색 중 (지도/장소 API)...")
-    restaurants = collect_restaurants(kakao_key, rec, multi, errors)
+    # [2/3] 맛집 검색 (지도 API 어댑터 + 키워드 정규화 미들웨어)
+    log("[2/3] 지역별 맛집 검색 중 (지도 어댑터 + 키워드 정규화)...")
+    restaurants = collect_restaurants(map_adapter, rec, multi, errors)
 
     # [3/3] 최종 리포트 생성
     log("[3/3] 최종 리포트 합성 생성 중 (LLM)...")
@@ -572,6 +838,7 @@ def main() -> None:
         "date": date,
         "tag": tag,
         "multi": multi,
+        "map_provider": map_adapter.provider_name,
         "recommendation": rec,
         "restaurants": restaurants,
         "errors": errors,
