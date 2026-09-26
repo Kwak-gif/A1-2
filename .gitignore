@@ -1,0 +1,16 @@
+# 비밀 키 파일 - 절대 공유 금지
+.env
+
+# 파이썬 가상환경 (부품 창고, 공유 불필요)
+venv/
+.venv/
+env/
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# OS/편집기 자동 생성 파일
+.DS_Store
+.idea/
+.vscode/

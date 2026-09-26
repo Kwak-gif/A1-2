@@ -1,0 +1,21 @@
+{
+  "date": "2026-09-26",
+  "recommendation": {
+    "recommended_city": "",
+    "recommended_cities": null,
+    "weather": "",
+    "events": [],
+    "reason": ""
+  },
+  "restaurants": {},
+  "errors": [
+    {
+      "step": "recommendation",
+      "message": "LLM 1차 추천 실패(재시도 후): Gemini 오류(status=404): {\n  \"error\": {\n    \"code\": 404,\n    \"message\": \"This model models/gemini-2.0-flash is no longer available. Please update your code to use models/gemini-3.8-flash for the latest features and improvemen"
+    },
+    {
+      "step": "report_generation",
+      "message": "LLM 리포트 실패 → 로컬 대체: Gemini 오류(status=404): {\n  \"error\": {\n    \"code\": 404,\n    \"message\": \"This model models/gemini-2.0-flash is no longer available. Please update your code to use models/gemini-3.8-flash for the latest features and improvemen"
+    }
+  ]
+}

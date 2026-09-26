@@ -1,0 +1,33 @@
+{
+  "date": "2026-09-25",
+  "recommendation": {
+    "recommended_city": "제주",
+    "weather": "맑고 온화함 (평균 15°C)",
+    "events": [
+      "제주 유채꽃 축제",
+      "서귀포 봄맞이 축제"
+    ],
+    "reason": "따뜻해진 날씨 속에서 만개한 유채꽃과 아름다운 자연경관을 즐기며 여유롭게 여행하기에 가장 적합한 시기입니다."
+  },
+  "restaurants": {
+    "제주": []
+  },
+  "errors": [
+    {
+      "step": "restaurant_search",
+      "message": "Kakao 오류(status=403) city=제주: {\"errorType\":\"NotAuthorizedError\",\"message\":\"App(장소검색프로젝트) disabled OPEN_MAP_AND_LOCAL service.\"}"
+    },
+    {
+      "step": "report_generation",
+      "message": "LLM 리포트 실패 → 로컬 대체: Gemini 오류(status=503): {\n  \"error\": {\n    \"code\": 503,\n    \"message\": \"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\n    \"status\": \"UNAVAILABLE\"\n  }\n}\n"
+    },
+    {
+      "step": "report_generation",
+      "message": "LLM 리포트 실패 → 로컬 대체: Gemini 오류(status=503): {\n  \"error\": {\n    \"code\": 503,\n    \"message\": \"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.\",\n    \"status\": \"UNAVAILABLE\"\n  }\n}\n"
+    },
+    {
+      "step": "report_generation",
+      "message": "LLM 리포트 실패 → 로컬 대체: Gemini 오류(status=404): {\n  \"error\": {\n    \"code\": 404,\n    \"message\": \"This model models/gemini-2.0-flash is no longer available. Please update your code to use models/gemini-3.8-flash for the latest features and improvemen"
+    }
+  ]
+}
